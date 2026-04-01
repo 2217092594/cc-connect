@@ -50,7 +50,10 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen unix socket: %w", err)
 	}
-	os.Chmod(sockPath, 0o600)
+	if err := os.Chmod(sockPath, 0o600); err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("chmod socket: %w", err)
+	}
 
 	s := &APIServer{
 		socketPath: sockPath,
@@ -62,6 +65,8 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 	s.mux.HandleFunc("/sessions", s.handleSessions)
 	s.mux.HandleFunc("/cron/add", s.handleCronAdd)
 	s.mux.HandleFunc("/cron/list", s.handleCronList)
+	s.mux.HandleFunc("/cron/info", s.handleCronInfo)
+	s.mux.HandleFunc("/cron/edit", s.handleCronEdit)
 	s.mux.HandleFunc("/cron/del", s.handleCronDel)
 	s.mux.HandleFunc("/relay/send", s.handleRelaySend)
 	s.mux.HandleFunc("/relay/bind", s.handleRelayBind)
@@ -106,8 +111,22 @@ func (s *APIServer) Start() {
 }
 
 func (s *APIServer) Stop() {
-	s.server.Close()
-	os.Remove(s.socketPath)
+	if s.server != nil {
+		if err := s.server.Close(); err != nil && err != http.ErrServerClosed {
+			slog.Debug("api server close failed", "error", err)
+		}
+	}
+	if err := os.Remove(s.socketPath); err != nil && !os.IsNotExist(err) {
+		slog.Debug("api server remove socket failed", "error", err)
+	}
+}
+
+func apiJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Error("api server: write JSON failed", "error", err)
+	}
 }
 
 func (s *APIServer) handleSend(w http.ResponseWriter, r *http.Request) {
@@ -153,8 +172,7 @@ func (s *APIServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	apiJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *APIServer) handleSessions(w http.ResponseWriter, r *http.Request) {
@@ -182,8 +200,7 @@ func (s *APIServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 		e.interactiveMu.Unlock()
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	apiJSON(w, http.StatusOK, result)
 }
 
 // ── Cron API ───────────────────────────────────────────────────
@@ -198,6 +215,8 @@ type CronAddRequest struct {
 	WorkDir     string `json:"work_dir"`
 	Description string `json:"description"`
 	Silent      *bool  `json:"silent,omitempty"`
+	SessionMode string `json:"session_mode,omitempty"`
+	TimeoutMins *int   `json:"timeout_mins,omitempty"`
 }
 
 func (s *APIServer) handleCronAdd(w http.ResponseWriter, r *http.Request) {
@@ -274,6 +293,8 @@ func (s *APIServer) handleCronAdd(w http.ResponseWriter, r *http.Request) {
 		Description: req.Description,
 		Enabled:     true,
 		Silent:      req.Silent,
+		SessionMode: NormalizeCronSessionMode(req.SessionMode),
+		TimeoutMins: req.TimeoutMins,
 	}
 	job.CreatedAt = time.Now()
 
@@ -282,8 +303,7 @@ func (s *APIServer) handleCronAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(job)
+	apiJSON(w, http.StatusOK, job)
 }
 
 func (s *APIServer) handleCronList(w http.ResponseWriter, r *http.Request) {
@@ -300,8 +320,7 @@ func (s *APIServer) handleCronList(w http.ResponseWriter, r *http.Request) {
 		jobs = s.cron.Store().List()
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(jobs)
+	apiJSON(w, http.StatusOK, jobs)
 }
 
 func (s *APIServer) handleCronDel(w http.ResponseWriter, r *http.Request) {
@@ -327,11 +346,77 @@ func (s *APIServer) handleCronDel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.cron.RemoveJob(req.ID) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		apiJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	} else {
 		http.Error(w, fmt.Sprintf("job %q not found", req.ID), http.StatusNotFound)
 	}
+}
+
+func (s *APIServer) handleCronInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.cron == nil {
+		http.Error(w, "cron scheduler not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+
+	job := s.cron.store.Get(id)
+	if job == nil {
+		http.Error(w, fmt.Sprintf("job %q not found", id), http.StatusNotFound)
+		return
+	}
+
+	apiJSON(w, http.StatusOK, job)
+}
+
+func (s *APIServer) handleCronEdit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.cron == nil {
+		http.Error(w, "cron scheduler not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		ID    string `json:"id"`
+		Field string `json:"field"`
+		Value any    `json:"value"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.ID == "" {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+	if req.Field == "" {
+		http.Error(w, "field is required", http.StatusBadRequest)
+		return
+	}
+	if req.Value == nil {
+		http.Error(w, "value is required", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.cron.UpdateJob(req.ID, req.Field, req.Value); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Return updated job
+	job := s.cron.Store().Get(req.ID)
+	apiJSON(w, http.StatusOK, job)
 }
 
 // ── Relay API ──────────────────────────────────────────────────
@@ -362,8 +447,7 @@ func (s *APIServer) handleRelaySend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	apiJSON(w, http.StatusOK, resp)
 }
 
 func (s *APIServer) handleRelayBind(w http.ResponseWriter, r *http.Request) {
@@ -391,8 +475,7 @@ func (s *APIServer) handleRelayBind(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.relay.Bind(req.Platform, req.ChatID, req.Bots)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	apiJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *APIServer) handleRelayBinding(w http.ResponseWriter, r *http.Request) {
@@ -410,6 +493,5 @@ func (s *APIServer) handleRelayBinding(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no binding found", http.StatusNotFound)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(binding)
+	apiJSON(w, http.StatusOK, binding)
 }

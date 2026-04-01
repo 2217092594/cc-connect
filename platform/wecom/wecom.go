@@ -1,6 +1,7 @@
 package wecom
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -12,8 +13,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,7 +49,8 @@ type xmlMessage struct {
 	Content      string   `xml:"Content"`
 	PicUrl       string   `xml:"PicUrl"`
 	MediaId      string   `xml:"MediaId"`
-	Format       string   `xml:"Format"` // voice format: amr, speex, etc.
+	FileName     string   `xml:"FileName"` // inbound file messages (MsgType=file)
+	Format       string   `xml:"Format"`   // voice format: amr, speex, etc.
 	MsgId        int64    `xml:"MsgId"`
 	AgentID      int64    `xml:"AgentID"`
 }
@@ -242,17 +247,37 @@ func (p *Platform) handleVerify(w http.ResponseWriter, msgSig, timestamp, nonce,
 	fmt.Fprint(w, plain)
 }
 
+// wecomLogXMLPreview returns a short prefix of XML for debug only (may contain user content).
+func wecomLogXMLPreview(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
 // handleMessage processes incoming encrypted message POSTs.
 func (p *Platform) handleMessage(w http.ResponseWriter, r *http.Request, msgSig, timestamp, nonce string) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
+		slog.Warn("wecom: read callback body failed", "error", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	slog.Info("wecom: callback POST received",
+		"body_bytes", len(body),
+		"content_length", r.ContentLength,
+		"has_msg_signature", msgSig != "",
+		"has_timestamp", timestamp != "",
+		"has_nonce", nonce != "")
+	if len(body) == 0 {
+		slog.Warn("wecom: empty callback POST body")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	var encMsg xmlEncryptedMsg
 	if err := xml.Unmarshal(body, &encMsg); err != nil {
-		slog.Error("wecom: parse xml failed", "error", err)
+		slog.Error("wecom: parse outer xml failed", "error", err, "body_bytes", len(body))
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -270,29 +295,41 @@ func (p *Platform) handleMessage(w http.ResponseWriter, r *http.Request, msgSig,
 		return
 	}
 
+	slog.Debug("wecom: decrypted xml preview", "preview", wecomLogXMLPreview(plainXML, 512))
+
 	// Return 200 immediately (WeChat Work requires response within 5 seconds)
 	w.WriteHeader(http.StatusOK)
 
 	var msg xmlMessage
 	if err := xml.Unmarshal([]byte(plainXML), &msg); err != nil {
-		slog.Error("wecom: parse decrypted xml failed", "error", err)
+		slog.Error("wecom: parse decrypted xml failed", "error", err,
+			"plain_len", len(plainXML),
+			"preview", wecomLogXMLPreview(plainXML, 256))
 		return
 	}
 
+	slog.Info("wecom: inbound parsed",
+		"msg_type", msg.MsgType,
+		"msg_id", msg.MsgId,
+		"from_user", msg.FromUserName,
+		"create_time", msg.CreateTime,
+		"has_media_id", msg.MediaId != "",
+		"file_name", msg.FileName)
+
 	if p.dedup.isDuplicate(msg.MsgId) {
-		slog.Debug("wecom: skipping duplicate message", "msg_id", msg.MsgId)
+		slog.Info("wecom: dropping duplicate message", "msg_id", msg.MsgId, "msg_type", msg.MsgType)
 		return
 	}
 
 	if msg.CreateTime > 0 {
 		if core.IsOldMessage(time.Unix(msg.CreateTime, 0)) {
-			slog.Debug("wecom: ignoring old message after restart", "create_time", msg.CreateTime)
+			slog.Info("wecom: ignoring old message after restart", "create_time", msg.CreateTime, "msg_type", msg.MsgType)
 			return
 		}
 	}
 
 	if !core.AllowList(p.allowFrom, msg.FromUserName) {
-		slog.Debug("wecom: message from unauthorized user", "user", msg.FromUserName)
+		slog.Warn("wecom: message rejected by allow_from", "user", msg.FromUserName, "msg_type", msg.MsgType)
 		return
 	}
 
@@ -301,12 +338,13 @@ func (p *Platform) handleMessage(w http.ResponseWriter, r *http.Request, msgSig,
 
 	switch msg.MsgType {
 	case "text":
-		slog.Debug("wecom: message received", "user", msg.FromUserName, "text_len", len(msg.Content))
+		text := stripWeComAtMentions(msg.Content, p.agentID)
+		slog.Debug("wecom: message received", "user", msg.FromUserName, "text_len", len(text))
 		go p.handler(p, &core.Message{
 			SessionKey: sessionKey, Platform: "wecom",
 			MessageID: strconv.FormatInt(msg.MsgId, 10),
-			UserID: msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
-			Content: msg.Content, ReplyCtx: rctx,
+			UserID:    msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
+			Content: text, ReplyCtx: rctx,
 		})
 
 	case "image":
@@ -320,8 +358,8 @@ func (p *Platform) handleMessage(w http.ResponseWriter, r *http.Request, msgSig,
 			p.handler(p, &core.Message{
 				SessionKey: sessionKey, Platform: "wecom",
 				MessageID: strconv.FormatInt(msg.MsgId, 10),
-				UserID: msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
-				Images:  []core.ImageAttachment{{MimeType: "image/jpeg", Data: imgData}},
+				UserID:    msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
+				Images:   []core.ImageAttachment{{MimeType: "image/jpeg", Data: imgData}},
 				ReplyCtx: rctx,
 			})
 		}()
@@ -341,14 +379,47 @@ func (p *Platform) handleMessage(w http.ResponseWriter, r *http.Request, msgSig,
 			p.handler(p, &core.Message{
 				SessionKey: sessionKey, Platform: "wecom",
 				MessageID: strconv.FormatInt(msg.MsgId, 10),
-				UserID: msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
+				UserID:    msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
 				Audio:    &core.AudioAttachment{MimeType: "audio/" + format, Data: audioData, Format: format},
 				ReplyCtx: rctx,
 			})
 		}()
 
+	case "file":
+		slog.Info("wecom: file message accepted", "user", msg.FromUserName, "file_name", msg.FileName, "media_id_len", len(msg.MediaId))
+		if msg.MediaId == "" {
+			slog.Warn("wecom: file message missing MediaId")
+			return
+		}
+		go func() {
+			fileData, err := p.downloadMedia(msg.MediaId)
+			if err != nil {
+				slog.Error("wecom: download file failed", "error", err)
+				return
+			}
+			baseName := filepath.Base(strings.TrimSpace(msg.FileName))
+			if baseName == "" || baseName == "." {
+				baseName = "attachment"
+			}
+			mt := wecomInboundFileMime(baseName, fileData)
+			p.handler(p, &core.Message{
+				SessionKey: sessionKey, Platform: "wecom",
+				MessageID: strconv.FormatInt(msg.MsgId, 10),
+				UserID:    msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
+				Files: []core.FileAttachment{{
+					MimeType: mt,
+					Data:     fileData,
+					FileName: baseName,
+				}},
+				ReplyCtx: rctx,
+			})
+		}()
+
 	default:
-		slog.Debug("wecom: ignoring unsupported message type", "type", msg.MsgType)
+		slog.Warn("wecom: unsupported inbound message type (no handler)",
+			"msg_type", msg.MsgType,
+			"msg_id", msg.MsgId,
+			"from_user", msg.FromUserName)
 	}
 }
 
@@ -392,6 +463,100 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	return p.Reply(ctx, rctx, content)
 }
+
+// SendImage uploads and sends an image to the user.
+// Implements core.ImageSender.
+func (p *Platform) SendImage(ctx context.Context, rctx any, img core.ImageAttachment) error {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return fmt.Errorf("wecom: SendImage: invalid reply context type %T", rctx)
+	}
+
+	accessToken, err := p.getAccessToken()
+	if err != nil {
+		return fmt.Errorf("wecom: send image: %w", err)
+	}
+
+	mediaID, err := p.uploadImageMedia(accessToken, img)
+	if err != nil {
+		return fmt.Errorf("wecom: send image: %w", err)
+	}
+
+	payload := map[string]any{
+		"touser":  rc.userID,
+		"msgtype": "image",
+		"agentid": p.agentID,
+		"image":   map[string]string{"media_id": mediaID},
+	}
+
+	body, _ := json.Marshal(payload)
+	apiURL := "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=" + accessToken
+
+	resp, err := p.apiClient.Post(apiURL, "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("wecom: send image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		ErrCode int    `json:"errcode"`
+		ErrMsg  string `json:"errmsg"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("wecom: decode send image response: %w", err)
+	}
+	if result.ErrCode != 0 {
+		return fmt.Errorf("wecom: send image failed: %d %s", result.ErrCode, result.ErrMsg)
+	}
+	return nil
+}
+
+// uploadImageMedia uploads an image to WeChat Work media API and returns the media_id.
+func (p *Platform) uploadImageMedia(accessToken string, img core.ImageAttachment) (string, error) {
+	name := img.FileName
+	if name == "" {
+		name = "image.png"
+	}
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	part, err := writer.CreateFormFile("media", name)
+	if err != nil {
+		return "", fmt.Errorf("wecom: create form file: %w", err)
+	}
+	if _, err := part.Write(img.Data); err != nil {
+		return "", fmt.Errorf("wecom: write image data: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return "", fmt.Errorf("wecom: close multipart writer: %w", err)
+	}
+
+	apiURL := "https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=" + accessToken + "&type=image"
+	resp, err := p.apiClient.Post(apiURL, writer.FormDataContentType(), body)
+	if err != nil {
+		return "", fmt.Errorf("wecom: upload image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		ErrCode int    `json:"errcode"`
+		ErrMsg  string `json:"errmsg"`
+		MediaID string `json:"media_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("wecom: decode upload response: %w", err)
+	}
+	if result.ErrCode != 0 {
+		return "", fmt.Errorf("wecom: upload image failed: %d %s", result.ErrCode, result.ErrMsg)
+	}
+	if result.MediaID == "" {
+		return "", fmt.Errorf("wecom: upload image: empty media_id")
+	}
+	return result.MediaID, nil
+}
+
+var _ core.ImageSender = (*Platform)(nil)
 
 func (p *Platform) sendMarkdown(accessToken, toUser, content string) error {
 	payload := map[string]any{
@@ -615,6 +780,22 @@ func (p *Platform) resolveUserName(userID string) string {
 		return result.Name
 	}
 	return userID
+}
+
+// wecomInboundFileMime infers MIME type from filename extension, then from content sniffing.
+func wecomInboundFileMime(fileName string, data []byte) string {
+	ext := strings.ToLower(filepath.Ext(fileName))
+	if ext != "" {
+		if mt := mime.TypeByExtension(ext); mt != "" {
+			return mt
+		}
+	}
+	if len(data) > 0 {
+		if sniff := http.DetectContentType(data); sniff != "" {
+			return sniff
+		}
+	}
+	return "application/octet-stream"
 }
 
 func (p *Platform) downloadMedia(mediaID string) ([]byte, error) {

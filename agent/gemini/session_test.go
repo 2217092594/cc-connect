@@ -250,9 +250,9 @@ func TestHandleMessage_MixedDeltaAndNonDelta(t *testing.T) {
 		"content": "Let me look at the files.",
 	})
 	gs.handleEvent(map[string]any{
-		"type":      "tool_use",
-		"tool_name": "shell",
-		"tool_id":   "t1",
+		"type":       "tool_use",
+		"tool_name":  "shell",
+		"tool_id":    "t1",
 		"parameters": map[string]any{"command": "ls"},
 	})
 	gs.handleEvent(map[string]any{
@@ -445,10 +445,10 @@ func TestSessionMessage_TextContent(t *testing.T) {
 
 func TestComputeLineDiff(t *testing.T) {
 	tests := []struct {
-		name     string
-		old      string
-		new_     string
-		want     string
+		name string
+		old  string
+		new_ string
+		want string
 	}{
 		{
 			"single line fully different",
@@ -493,5 +493,17 @@ func TestComputeLineDiff(t *testing.T) {
 				t.Errorf("computeLineDiff:\n  old=%q\n  new=%q\n  got=%q\n  want=%q", tt.old, tt.new_, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestGeminiSession_ContinueSessionTreatedAsFresh(t *testing.T) {
+	s, err := newGeminiSession(context.Background(), "echo", "/tmp", "", "default", core.ContinueSession, nil, 0)
+	if err != nil {
+		t.Fatalf("newGeminiSession: %v", err)
+	}
+	defer s.Close()
+
+	if got := s.CurrentSessionID(); got != "" {
+		t.Errorf("ContinueSession should be treated as fresh: chatID = %q, want empty", got)
 	}
 }

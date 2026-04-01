@@ -38,7 +38,7 @@ type Agent struct {
 	providers  []core.ProviderConfig
 	activeIdx  int
 	sessionEnv []string
-	mu         sync.Mutex
+	mu         sync.RWMutex
 }
 
 func New(opts map[string]any) (core.Agent, error) {
@@ -124,16 +124,13 @@ func (a *Agent) SetModel(model string) {
 func (a *Agent) GetModel() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.model
+	return core.GetProviderModel(a.providers, a.activeIdx, a.model)
 }
 
 func (a *Agent) configuredModels() []core.ModelOption {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.activeIdx < 0 || a.activeIdx >= len(a.providers) {
-		return nil
-	}
-	return a.providers[a.activeIdx].Models
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return core.GetProviderModels(a.providers, a.activeIdx)
 }
 
 func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
@@ -461,12 +458,12 @@ func slugify(s string) string {
 
 // sessionFile represents the JSON structure of a Gemini CLI session file.
 type sessionFile struct {
-	SessionID   string    `json:"sessionId"`
-	ProjectHash string    `json:"projectHash"`
-	StartTime   time.Time `json:"startTime"`
-	LastUpdated time.Time `json:"lastUpdated"`
+	SessionID   string           `json:"sessionId"`
+	ProjectHash string           `json:"projectHash"`
+	StartTime   time.Time        `json:"startTime"`
+	LastUpdated time.Time        `json:"lastUpdated"`
 	Messages    []sessionMessage `json:"messages"`
-	Kind        string    `json:"kind"`
+	Kind        string           `json:"kind"`
 }
 
 // sessionMessage represents a message in the Gemini session file.

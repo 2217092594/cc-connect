@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,7 +13,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"encoding/json"
 	"unicode/utf8"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -37,7 +37,7 @@ type Agent struct {
 	providers  []core.ProviderConfig
 	activeIdx  int
 	sessionEnv []string
-	mu         sync.Mutex
+	mu         sync.RWMutex
 }
 
 func New(opts map[string]any) (core.Agent, error) {
@@ -52,7 +52,6 @@ func New(opts map[string]any) (core.Agent, error) {
 	if cmd == "" {
 		cmd = "agent"
 	}
-
 	if _, err := exec.LookPath(cmd); err != nil {
 		return nil, fmt.Errorf("cursor: %q CLI not found in PATH, install with: npm i -g @anthropic-ai/cursor-agent (or from Cursor IDE settings)", cmd)
 	}
@@ -106,16 +105,13 @@ func (a *Agent) SetModel(model string) {
 func (a *Agent) GetModel() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.model
+	return core.GetProviderModel(a.providers, a.activeIdx, a.model)
 }
 
 func (a *Agent) configuredModels() []core.ModelOption {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.activeIdx < 0 || a.activeIdx >= len(a.providers) {
-		return nil
-	}
-	return a.providers[a.activeIdx].Models
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return core.GetProviderModels(a.providers, a.activeIdx)
 }
 
 func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {

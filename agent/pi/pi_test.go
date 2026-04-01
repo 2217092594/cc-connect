@@ -522,15 +522,15 @@ func TestHandleMessageUpdate_ThinkingAccumulation(t *testing.T) {
 
 	// Multiple thinking deltas should be accumulated.
 	s.handleEvent(map[string]any{
-		"type": "message_update",
+		"type":                  "message_update",
 		"assistantMessageEvent": map[string]any{"type": "thinking_delta", "delta": "Let me "},
 	})
 	s.handleEvent(map[string]any{
-		"type": "message_update",
+		"type":                  "message_update",
 		"assistantMessageEvent": map[string]any{"type": "thinking_delta", "delta": "think about "},
 	})
 	s.handleEvent(map[string]any{
-		"type": "message_update",
+		"type":                  "message_update",
 		"assistantMessageEvent": map[string]any{"type": "thinking_delta", "delta": "this."},
 	})
 
@@ -542,7 +542,7 @@ func TestHandleMessageUpdate_ThinkingAccumulation(t *testing.T) {
 
 	// thinking_end triggers the accumulated event.
 	s.handleEvent(map[string]any{
-		"type": "message_update",
+		"type":                  "message_update",
 		"assistantMessageEvent": map[string]any{"type": "thinking_end"},
 	})
 
@@ -564,7 +564,7 @@ func TestHandleMessageUpdate_ThinkingEndEmpty(t *testing.T) {
 
 	// thinking_end with no prior deltas should not emit.
 	s.handleEvent(map[string]any{
-		"type": "message_update",
+		"type":                  "message_update",
 		"assistantMessageEvent": map[string]any{"type": "thinking_end"},
 	})
 
@@ -580,7 +580,7 @@ func TestHandleMessageUpdate_ThinkingDeltaEmpty(t *testing.T) {
 
 	// Empty deltas should not grow the buffer.
 	s.handleEvent(map[string]any{
-		"type": "message_update",
+		"type":                  "message_update",
 		"assistantMessageEvent": map[string]any{"type": "thinking_delta", "delta": ""},
 	})
 
@@ -911,6 +911,22 @@ func TestPiSession_NewWithResumeID(t *testing.T) {
 
 	if s.CurrentSessionID() != "resume-id" {
 		t.Errorf("sessionID = %q", s.CurrentSessionID())
+	}
+}
+
+func TestPiSession_ContinueSessionTreatedAsFresh(t *testing.T) {
+	// ContinueSession ("__continue__") is a sentinel used by the engine to tell
+	// Claude Code to pick up the latest CLI session via --continue. Agents that
+	// don't support --continue must treat it as "" (fresh session), otherwise
+	// they pass the literal "__continue__" as a session ID which always fails.
+	s, err := newPiSession(context.Background(), "echo", "/tmp", "", "default", "", core.ContinueSession, nil)
+	if err != nil {
+		t.Fatalf("newPiSession: %v", err)
+	}
+	defer s.Close()
+
+	if got := s.CurrentSessionID(); got != "" {
+		t.Errorf("ContinueSession should be treated as fresh: sessionID = %q, want empty", got)
 	}
 }
 

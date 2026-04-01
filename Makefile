@@ -33,8 +33,9 @@ PLATFORMS := \
 #   make build EXCLUDE=discord,dingtalk,qq,qqbot,line
 # ---------------------------------------------------------------------------
 
-ALL_AGENTS    := claudecode codex cursor gemini iflow opencode pi qoder
-ALL_PLATFORMS := feishu telegram discord slack dingtalk wecom qq qqbot line
+ALL_AGENTS    := acp claudecode codex cursor gemini iflow opencode pi qoder
+ALL_PLATFORMS := feishu telegram discord slack dingtalk wecom weixin qq qqbot line
+ALL_EXTRAS    := web
 
 COMMA := ,
 
@@ -57,13 +58,24 @@ ifdef EXCLUDE
   _EXCLUDE_TAGS += $(addprefix no_,$(subst $(COMMA), ,$(EXCLUDE)))
 endif
 
+ifdef NO_WEB
+  _EXCLUDE_TAGS += no_web
+endif
+
 _BUILD_TAGS := $(strip $(_EXCLUDE_TAGS))
 _TAGS_FLAG  := $(if $(_BUILD_TAGS),-tags '$(_BUILD_TAGS)',)
 
-.PHONY: build run clean test lint release release-all
+.PHONY: build run clean test test-fast test-full test-smoke test-e2e test-release test-performance pre-test lint release release-all web
 
-build:
+web:
+	@if [ ! -d web/node_modules ]; then cd web && npm install; fi
+	cd web && npm run build
+
+build: web
 	go build $(_TAGS_FLAG) -ldflags "$(LDFLAGS)" -o $(APP) $(CMD)
+
+build-noweb:
+	go build $(_TAGS_FLAG) -tags 'no_web' -ldflags "$(LDFLAGS)" -o $(APP) $(CMD)
 
 run: build
 	./$(APP)
@@ -72,6 +84,52 @@ clean:
 	rm -f $(APP)
 	rm -rf $(DIST)
 
+# ---------------------------------------------------------------------------
+# Testing targets.
+#
+# test-fast:  Unit tests + smoke tests (< 2 min). Runs on every push.
+# test-full:   Full test suite including regression (< 10 min). PR requirement.
+# test-smoke:  Smoke tests only (< 1 min). Quick sanity check.
+# test-e2e:    E2E and regression tests only.
+# test-release: Full + performance benchmarks. Before release.
+# pre-test:    Prerequisites (build + vet) before running tests.
+# ---------------------------------------------------------------------------
+
+pre-test:
+	go build ./...
+	go vet ./...
+
+# Fast test: unit tests + smoke tests
+test-fast: pre-test
+	go test -parallel=4 -race ./...
+	go test -parallel=4 -tags=smoke ./tests/e2e/...
+
+# Full test: unit + smoke + regression (PR requirement)
+test-full: pre-test
+	go test -parallel=4 -race ./...
+	go test -parallel=4 -tags=smoke ./tests/e2e/...
+	go test -parallel=2 -tags=regression ./tests/e2e/...
+
+# Smoke tests only
+test-smoke: pre-test
+	go test -v -tags=smoke ./tests/e2e/...
+
+# E2E/regression tests only
+test-e2e: pre-test
+	go test -v -tags=regression ./tests/e2e/...
+
+# Performance benchmarks only
+test-performance: pre-test
+	go test -bench=. -benchmem -tags=performance ./tests/performance/...
+
+# Release test: full + performance benchmarks
+test-release: pre-test
+	go test -parallel=4 -race ./...
+	go test -parallel=4 -tags=smoke ./tests/e2e/...
+	go test -parallel=2 -tags=regression ./tests/e2e/...
+	go test -bench=. -benchmem -tags=performance ./tests/performance/...
+
+# Legacy: runs unit tests only
 test:
 	go test -v ./...
 
